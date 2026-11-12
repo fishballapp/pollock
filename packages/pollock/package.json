@@ -1,0 +1,52 @@
+{
+  "name": "@fsh.ba/pollock",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A lock queue for coding agents on one machine: leases that outlive the command, FIFO waiting, idle shutdown.",
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "lock",
+    "lease",
+    "mutex",
+    "semaphore",
+    "queue",
+    "cli"
+  ],
+  "homepage": "https://github.com/fishballapp/pollock",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fishballapp/pollock.git",
+    "directory": "packages/pollock"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "bin": {
+    "pollock": "./src/bin.ts"
+  },
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public",
+    "bin": {
+      "pollock": "./dist/bin.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "prepack": "pnpm build",
+    "test": "vitest run",
+    "check:effect": "effect-tsgo diagnostics --project tsconfig.json --format text"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "effect": "catalog:",
+    "tsdown": "catalog:",
+    "vitest": "catalog:"
+  }
+}
