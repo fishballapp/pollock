@@ -132,17 +132,30 @@ pollock [<resource>] status [--json]
 ```
 
 Every resource in use or configured (or just the one named): who holds it, **for how long**, and
-for what, then the line. A table by default; JSON with `--json`. The `--json` shape is stable, for scripts and
-harness hooks to read: `{"resources": [{"resource", "capacity", "holders": [{"lease", "resource",
-"session", "note", "acquiredAt", "heldFor"}], "queue": [{"position", "session", "note",
-"waitingSince", "keptUntil"}], "hookRunning", "lastDown"}]}`. Fields may be added; none is renamed
-or removed without a major version.
+for what, then the line, then the `down` it is still owed. A table by default; JSON with `--json`.
+The `--json` shape is stable, for scripts and harness hooks to read: `{"resources": [{"resource",
+"capacity", "holders": [{"lease", "resource", "session", "note", "acquiredAt", "heldFor"}],
+"queue": [{"position", "session", "note", "waitingSince", "keptUntil"}], "hookRunning",
+"pendingDown", "lastDown"}]}`. Fields may be added; none is renamed or removed without a major
+version.
 
 ```
 macos-vm  capacity 1, 1 held, 1 waiting
   held for 2h14m by builder-3 ("release build")  since 09:02:11, lease 2bq8r0c1zt
   1. docs-9  waiting 41s  "screenshots for the docs"
+  down once it has been idle for 20m
+
+linux-box  capacity unlimited, 0 held, 0 waiting
+  down in 12m
+  last down 3h2m ago, exit 0
 ```
+
+`pendingDown` is the shutdown a resource with `down` is still owed: `null` when there is none (it
+has not been used since its last `down`, or `down` is running now: see `hookRunning`), otherwise
+`{"at", "watcherRestarted"}`. `at` is when `down` is due, `null` while the resource is held or
+someone is in line. So a resource that is idle and still up always shows when it will go down.
+`watcherRestarted` is true when this `status` found no watcher alive to run it and started one
+([below](#the-watcher)); the table says so too.
 
 ## If a holder never releases
 
@@ -229,11 +242,24 @@ Both run through `/bin/sh -c`, with `POLLOCK_RESOURCE` set to the resource's nam
 - Each hook's output goes to `<state dir>/hooks/<resource>.<up|down>.log`, replaced on each run.
   A process a successful hook leaves running keeps running.
 
-`down` needs something alive after everyone has left. So a grant on a resource with `down` starts
-one small watcher process for it, detached from the agent. It runs `down` once the resource has
-been idle for `idleAfter`, records how it went (shown in `status`), and exits. Resources without
-`down` start no watcher. A reboot kills the watcher; the next `up` brings the resource back
-regardless.
+### The watcher
+
+`down` needs something alive after everyone has left. So a resource with `down` gets one small
+watcher process, detached from the agent and from the command that started it. It runs `down` once
+the resource has been idle for `idleAfter`, counted from the release that left it idle, records
+how it went (shown in `status`), and exits. Resources without `down` start no watcher.
+
+`down` does not depend on any process a holder started. A grant starts the watcher, and so does
+every `release`, forced or not, from any session. So when
+a holder's processes are all gone (a harness that stops an agent may kill everything its commands
+started, the watcher included) and someone frees its lease with `release --force`, that release's
+watcher runs `down`.
+
+What pollock cannot do without a daemon is notice a watcher killed later, while the resource sits
+idle with nobody running a command. Then `down` waits for the next pollock command that looks at
+the resource: `status` (for that resource or for all), `acquire`, or `release` (one with nothing
+to release too). It starts a new watcher, which runs an overdue `down` at once. A reboot kills the
+watcher too; the next `up` brings the resource back regardless.
 
 ## Worked example: an owner holds the VM while a helper works in it
 

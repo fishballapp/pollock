@@ -229,9 +229,7 @@ const statusCommand = Command.make(
         });
         if (isJson) {
           return yield* print({
-            resources: resources.map(({ snapshot, settings }) =>
-              statusView(snapshot, settings, now),
-            ),
+            resources: resources.map(resource => statusView(resource, now)),
           });
         }
         return yield* Console.log(formatStatus(resources, now));

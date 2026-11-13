@@ -32,11 +32,14 @@ import {
   leaveWatch,
   markInUse,
   markReported,
+  type OwedDown,
+  owedDown,
   placeOf,
   type ReleaseLookup,
   type ResourceSnapshot,
   randomId,
   release,
+  replaceWatcher,
   snapshot,
   step,
   watchStep,
@@ -86,6 +89,15 @@ export type Acquired =
       readonly holders: readonly Lease[];
       readonly now: number;
     };
+
+export type ResourceStatus = {
+  readonly snapshot: ResourceSnapshot;
+  readonly settings: ResourceSettings;
+  /** The `down` the resource is owed, if any. */
+  readonly owedDown: OwedDown | undefined;
+  /** This `status` found no watcher alive to run it, and started one. */
+  readonly isWatcherRestarted: boolean;
+};
 
 export type Released = { readonly lease: Lease; readonly isForced: boolean; readonly now: number };
 
@@ -160,12 +172,10 @@ export class Locks extends Context.Service<
       readonly leaseId: string | undefined;
       readonly isForced: boolean;
     }) => Effect.Effect<Released, UsageError | NotHeldError>;
+    /** Every resource (or the one named); starts a watcher for one owed a `down` with none alive. */
     readonly status: (options: { readonly resource: string | undefined }) => Effect.Effect<{
       readonly now: number;
-      readonly resources: readonly {
-        readonly snapshot: ResourceSnapshot;
-        readonly settings: ResourceSettings;
-      }[];
+      readonly resources: readonly ResourceStatus[];
     }>;
     /** The idle watcher of `resource`: runs `down` once it is idle, then exits. */
     readonly watch: (resource: string) => Effect.Effect<void>;
@@ -191,6 +201,29 @@ export class Locks extends Context.Service<
       });
 
       const say = (line: string) => Console.error(`pollock: ${line}`);
+
+      /**
+       * Starts a watcher for the `down` owed to `resource` if none is alive to run it; true when it
+       * did. The heartbeat says a watcher is gone only once stale; within that window its pid
+       * usually does, and a pid another process took since hides it until then.
+       */
+      const repairWatcher = Effect.fnUntraced(function* (resource: string, owed: OwedDown) {
+        const { isWatched, watcherPid } = owed;
+        if (isWatched) {
+          if (watcherPid === null || (yield* processes.isRunning(watcherPid))) return false;
+          yield* transact((db, now) => replaceWatcher(db, { resource, pid: watcherPid, now }));
+        }
+        yield* processes.startWatcher(resource);
+        return true;
+      });
+
+      /** `repairWatcher` for a command that has not looked at what `resource` is owed yet. */
+      const lookAfter = Effect.fnUntraced(function* (resource: string) {
+        const owed = yield* transact((db, now) =>
+          owedDown(db, { resource: settings.resource(resource), now, timings }),
+        );
+        if (owed !== undefined) yield* repairWatcher(resource, owed);
+      });
 
       /**
        * Says `line` when `key` differs from the last one said, so progress prints when the state
@@ -417,6 +450,7 @@ export class Locks extends Context.Service<
             );
             if (waited._tag === 'TimedOut') return waited;
             if (waited._tag === 'TicketGone') {
+              yield* lookAfter(name);
               return yield* new TicketGoneError({
                 message: waited.isNamed
                   ? `Ticket ${ticket} is gone: a place is kept ${formatDuration(timings.ticketGraceMs)} after its wait runs out. Run \`pollock ${name} acquire\` again, without --ticket, to join the end of the line.`
@@ -441,7 +475,12 @@ export class Locks extends Context.Service<
         release: Effect.fn('Locks.release')(function* ({ resource, session, leaseId, isForced }) {
           const found = yield* transact((db, now) => {
             const lookup = leaseToRelease(db, { resource, session, leaseId, isForced });
-            if (lookup._tag !== 'Found') return lookup;
+            if (lookup._tag !== 'Found') {
+              return {
+                ...lookup,
+                owedDown: owedDown(db, { resource: settings.resource(resource), now, timings }),
+              };
+            }
             const isTakenFromAnother = lookup.lease.session !== session;
             release(db, {
               lease: lookup.lease,
@@ -449,28 +488,54 @@ export class Locks extends Context.Service<
               endedBy: isTakenFromAnother ? session : undefined,
               now,
             });
-            return { ...lookup, isForced: isTakenFromAnother, now };
+            return {
+              ...lookup,
+              isForced: isTakenFromAnother,
+              now,
+              owedDown: owedDown(db, { resource: settings.resource(resource), now, timings }),
+            };
           });
-          if (found._tag !== 'Found') return yield* lookupError(found, { resource, session });
+          const { owedDown: owed } = found;
+          if (found._tag !== 'Found') {
+            if (owed !== undefined) yield* repairWatcher(resource, owed);
+            return yield* lookupError(found, { resource, session });
+          }
+          // A release starts a watcher whether or not one looks alive: one killed moments ago
+          // still does, and this may be the last command the resource ever sees. The new one
+          // leaves if the other proves alive.
+          if (owed !== undefined) yield* processes.startWatcher(resource);
           return { lease: found.lease, isForced: found.isForced, now: found.now };
         }),
 
         status: Effect.fn('Locks.status')(function* ({ resource }) {
-          const { snapshots, now } = yield* transact((db, now) => ({
-            snapshots: snapshot(db, {
+          const { found, now } = yield* transact((db, now) => ({
+            found: snapshot(db, {
               only: resource,
               alsoInclude: settings.configured.map(({ name }) => name),
               now,
               timings,
+            }).map(found => {
+              const resourceSettings = settings.resource(found.resource);
+              return {
+                snapshot: found,
+                settings: resourceSettings,
+                owedDown: owedDown(db, { resource: resourceSettings, now, timings }),
+              };
             }),
             now,
           }));
+          // A watcher that was killed is replaced by the next command that looks, this one included.
           return {
             now,
-            resources: snapshots.map(found => ({
-              snapshot: found,
-              settings: settings.resource(found.resource),
-            })),
+            resources: yield* Effect.forEach(
+              found,
+              Effect.fnUntraced(function* (resource) {
+                const { owedDown: owed } = resource;
+                const isWatcherRestarted =
+                  owed !== undefined && (yield* repairWatcher(resource.settings.name, owed));
+                return { ...resource, isWatcherRestarted };
+              }),
+            ),
           };
         }),
 
@@ -501,6 +566,10 @@ export class Locks extends Context.Service<
               }),
             );
           });
+          // Another watcher looking alive may have been killed with no chance to clean up: it looks
+          // alive until its last look goes stale. So this one looks again once after that long, and
+          // leaves only if the other is still refreshing.
+          const hasWaitedOutAnother = yield* Ref.make(false);
           // Each look offers a fresh token, which becomes the slot's if this look claims it.
           const look = Effect.gen(function* () {
             const token = randomId();
@@ -510,6 +579,9 @@ export class Locks extends Context.Service<
             );
             if (looked === 'down') yield* runDown(token);
             if (looked === 'wait') yield* Effect.sleep(Duration.millis(intervalMs));
+            if (looked !== 'taken') return looked;
+            if (yield* Ref.getAndSet(hasWaitedOutAnother, true)) return 'exit';
+            yield* Effect.sleep(Duration.millis(timings.staleMs));
             return looked;
           });
           yield* look.pipe(

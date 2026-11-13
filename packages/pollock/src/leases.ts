@@ -397,8 +397,24 @@ export const keepPlace = (
 // ─── Hooks and the idle watcher ──────────────────────────────────────────────────────────────────
 
 /**
+ * Whether a watcher of `resource` looks alive: registered and refreshing, or just being started.
+ * If none does, notes one as being started, which the caller must then do: a command that arrives
+ * before it registers starts no second one.
+ */
+const expectWatcher = (
+  db: DatabaseSync,
+  { state, now, timings }: { state: ResourceState; now: number; timings: Timings },
+): boolean => {
+  if (isFresh(state.watcherSeenAt, { now, timings })) return true;
+  db.prepare(
+    'UPDATE resource_state SET watcher_pid = NULL, watcher_seen_at = $now WHERE resource = $resource',
+  ).run({ resource: state.resource, now });
+  return false;
+};
+
+/**
  * Notes that `resource` is in use, so the watcher owes it a `down`. True when the resource has
- * `down` and no watcher is alive to run it.
+ * `down` and no watcher looks alive to run it: the caller must start one.
  */
 export const markInUse = (
   db: DatabaseSync,
@@ -409,7 +425,7 @@ export const markInUse = (
   db.prepare(
     'UPDATE resource_state SET needs_down = 1, idle_since = NULL WHERE resource = $resource',
   ).run({ resource: resource.name });
-  return !isFresh(state.watcherSeenAt, { now, timings });
+  return !expectWatcher(db, { state, now, timings });
 };
 
 export type HookClaim =
@@ -478,12 +494,85 @@ export const heartbeatWatcher = (
     .prepare('UPDATE resource_state SET watcher_seen_at = $now WHERE resource = $resource')
     .run({ resource, now });
 
-export type WatchStep = 'exit' | 'wait' | 'down';
+/**
+ * Whether a `down` is still to run: owed since a grant, or begun by a watcher that was killed
+ * while running it (its claim on the hook slot went stale with no result recorded).
+ */
+const isDownOwed = (state: ResourceState, { now, timings }: { now: number; timings: Timings }) =>
+  state.needsDown === 1 || (state.hook === 'down' && !isFresh(state.hookSeenAt, { now, timings }));
 
 /**
- * One look by the watcher of `resource` (process `pid`). It exits if another watcher is alive, or
- * once nothing is owed; claims the hook slot for `down` under `token` once the resource has been
- * idle (no holders, no one in line) for `idleAfter`.
+ * Runs the idle clock of `resource`: started once nobody holds it or waits in line, stopped
+ * otherwise. Since when it has been idle, or null while it is in use.
+ */
+const trackIdle = (
+  db: DatabaseSync,
+  { resource, state, now }: { resource: string; state: ResourceState; now: number },
+): number | null => {
+  const isInUse = leasesOf(db, resource).length > 0 || waitersOf(db, resource).length > 0;
+  const idleSince = isInUse ? null : (state.idleSince ?? now);
+  db.prepare('UPDATE resource_state SET idle_since = $idleSince WHERE resource = $resource').run({
+    resource,
+    idleSince,
+  });
+  return idleSince;
+};
+
+export type OwedDown = {
+  /** When `down` is due: `idleAfter` after the resource went idle. Null while it is in use. */
+  readonly dueAt: number | null;
+  /**
+   * Whether a watcher looks alive to run it; one killed in the last `staleMs` still does. When
+   * false, the caller must start one.
+   */
+  readonly isWatched: boolean;
+  /** The registered watcher's process, for a caller that can tell sooner whether it is gone. */
+  readonly watcherPid: number | null;
+};
+
+/**
+ * The `down` owed to `resource`, as a command other than the watcher finds it; undefined when
+ * none is. Starts the idle clock if the resource has just been left idle, so `down` is due from
+ * the release, whenever a watcher next looks.
+ */
+export const owedDown = (
+  db: DatabaseSync,
+  { resource, now, timings }: { resource: ResourceSettings; now: number; timings: Timings },
+): OwedDown | undefined => {
+  const { down } = resource;
+  if (down === undefined) return undefined;
+  const state = stateOf(db, resource.name);
+  if (state === undefined || !isDownOwed(state, { now, timings })) return undefined;
+  const idleSince = trackIdle(db, { resource: resource.name, state, now });
+  return {
+    dueAt: idleSince === null ? null : idleSince + down.idleAfterMs,
+    isWatched: expectWatcher(db, { state, now, timings }),
+    watcherPid: state.watcherPid,
+  };
+};
+
+/**
+ * Notes that the registered watcher `pid` of `resource` is gone and another is being started, so
+ * that one takes over at once instead of waiting out a heartbeat nobody refreshes any more.
+ */
+export const replaceWatcher = (
+  db: DatabaseSync,
+  { resource, pid, now }: { resource: string; pid: number; now: number },
+) =>
+  db
+    .prepare(
+      `UPDATE resource_state SET watcher_pid = NULL, watcher_seen_at = $now
+       WHERE resource = $resource AND watcher_pid = $pid`,
+    )
+    .run({ resource, pid, now });
+
+export type WatchStep = 'exit' | 'wait' | 'down' | 'taken';
+
+/**
+ * One look by the watcher of `resource` (process `pid`). `taken` if another watcher is registered
+ * and looks alive. Otherwise it registers itself, exits once nothing is owed, and claims the hook
+ * slot for `down` under `token` once the resource has been idle (no holders, no one in line) for
+ * `idleAfter`.
  */
 export const watchStep = (
   db: DatabaseSync,
@@ -498,36 +587,22 @@ export const watchStep = (
   const { down } = resource;
   if (down === undefined) return 'exit';
   const state = ensureState(db, resource.name);
-  const params = { resource: resource.name, now, pid };
-  if (state.watcherPid !== pid && isFresh(state.watcherSeenAt, { now, timings })) return 'exit';
+  const isTaken = state.watcherPid !== null && state.watcherPid !== pid;
+  if (isTaken && isFresh(state.watcherSeenAt, { now, timings })) return 'taken';
   db.prepare(
     'UPDATE resource_state SET watcher_pid = $pid, watcher_seen_at = $now WHERE resource = $resource',
-  ).run(params);
-  const isInUse = leasesOf(db, resource.name).length > 0 || waitersOf(db, resource.name).length > 0;
-  if (isInUse) {
-    db.prepare('UPDATE resource_state SET idle_since = NULL WHERE resource = $resource').run({
-      resource: resource.name,
-    });
-    return 'wait';
-  }
-  if (state.needsDown === 0) {
+  ).run({ resource: resource.name, now, pid });
+  const idleSince = trackIdle(db, { resource: resource.name, state, now });
+  if (idleSince === null) return 'wait';
+  if (!isDownOwed(state, { now, timings })) {
     db.prepare(
       'UPDATE resource_state SET watcher_pid = NULL, watcher_seen_at = NULL WHERE resource = $resource',
     ).run({ resource: resource.name });
     return 'exit';
   }
-  if (state.idleSince === null) {
-    db.prepare('UPDATE resource_state SET idle_since = $now WHERE resource = $resource').run({
-      resource: resource.name,
-      now,
-    });
-    return 'wait';
-  }
-  if (now - state.idleSince < down.idleAfterMs) return 'wait';
+  if (now - idleSince < down.idleAfterMs) return 'wait';
   const claim = claimHook(db, { resource: resource.name, hook: 'down', token, now, timings });
-  if (claim._tag === 'Busy') {
-    return 'wait';
-  }
+  if (claim._tag === 'Busy') return 'wait';
   db.prepare('UPDATE resource_state SET needs_down = 0 WHERE resource = $resource').run({
     resource: resource.name,
   });

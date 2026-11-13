@@ -1,8 +1,8 @@
 // What commands print. stdout carries one JSON object per command (`status` prints a table unless
 // `--json`), so an agent can parse it; anything said along the way goes to stderr.
 import { formatDuration } from './duration.ts';
-import type { Lease, ResourceSnapshot, Waiter } from './leases.ts';
-import type { ResourceSettings } from './settings.ts';
+import type { Lease, OwedDown, Waiter } from './leases.ts';
+import type { ResourceStatus } from './locks.ts';
 
 const iso = (ms: number) => Temporal.Instant.fromEpochMilliseconds(ms).toString();
 
@@ -37,8 +37,12 @@ const waiterView = (waiter: Waiter, index: number) => ({
 });
 
 export const statusView = (
-  { resource, leases, line, state, runningHook }: ResourceSnapshot,
-  settings: ResourceSettings,
+  {
+    snapshot: { resource, leases, line, state, runningHook },
+    settings,
+    owedDown,
+    isWatcherRestarted,
+  }: ResourceStatus,
   now: number,
 ) => ({
   resource,
@@ -46,6 +50,14 @@ export const statusView = (
   holders: leases.map(lease => leaseView(lease, now)),
   queue: line.map(waiterView),
   hookRunning: runningHook,
+  // The `down` still to run: `at` is null while the resource is held or waited for.
+  pendingDown:
+    owedDown === undefined
+      ? null
+      : {
+          at: owedDown.dueAt === null ? null : iso(owedDown.dueAt),
+          watcherRestarted: isWatcherRestarted,
+        },
   lastDown:
     state?.lastDownAt == null
       ? null
@@ -67,28 +79,61 @@ export const describeHolders = (holders: readonly Lease[], now: number) => {
     .join('; ')}.`;
 };
 
+/** When the owed `down` runs, for people. */
+const describeOwedDown = (
+  { dueAt }: OwedDown,
+  {
+    idleAfterMs,
+    isWatcherRestarted,
+    now,
+  }: { idleAfterMs: number | undefined; isWatcherRestarted: boolean; now: number },
+) => {
+  const when = (() => {
+    if (dueAt === null) {
+      return `down once it has been idle${idleAfterMs === undefined ? '' : ` for ${formatDuration(idleAfterMs)}`}`;
+    }
+    if (dueAt <= now) return `down was due ${roughly(now - dueAt)} ago`;
+    return `down in ${roughly(dueAt - now)}`;
+  })();
+  return `  ${when}${isWatcherRestarted ? ' (its watcher was gone; started a new one)' : ''}`;
+};
+
 /** The human `status`: a block per resource, each holder led by how long it has held. */
-export const formatStatus = (
-  snapshots: readonly { snapshot: ResourceSnapshot; settings: ResourceSettings }[],
-  now: number,
-): string => {
-  if (snapshots.length === 0) return 'No resources in use or configured.';
-  return snapshots
-    .map(({ snapshot: { resource, leases, line, state, runningHook }, settings }) => {
-      const header = `${resource}  capacity ${capacityView(settings.capacity)}, ${leases.length} held, ${line.length} waiting${runningHook === null ? '' : `, running ${runningHook}`}`;
-      const leaseLines = leases.map(
-        lease =>
-          `  held for ${roughly(now - lease.acquiredAt)} by ${lease.session}${noteOf(lease)}  since ${clockTime(lease.acquiredAt)}, lease ${lease.id}`,
-      );
-      const queueLines = line.map(
-        (waiter, index) =>
-          `  ${index + 1}. ${waiter.session}  waiting ${roughly(now - waiter.enqueuedAt)}${waiter.keptUntil === null ? '' : `  (place kept ${roughly(waiter.keptUntil - now)} more)`}${waiter.note === null ? '' : `  "${waiter.note}"`}`,
-      );
-      const downLine =
-        state?.lastDownAt == null
-          ? []
-          : [`  last down ${roughly(now - state.lastDownAt)} ago, exit ${state.lastDownExit}`];
-      return [header, ...leaseLines, ...queueLines, ...downLine].join('\n');
-    })
+export const formatStatus = (resources: readonly ResourceStatus[], now: number): string => {
+  if (resources.length === 0) return 'No resources in use or configured.';
+  return resources
+    .map(
+      ({
+        snapshot: { resource, leases, line, state, runningHook },
+        settings,
+        owedDown,
+        isWatcherRestarted,
+      }) => {
+        const header = `${resource}  capacity ${capacityView(settings.capacity)}, ${leases.length} held, ${line.length} waiting${runningHook === null ? '' : `, running ${runningHook}`}`;
+        const leaseLines = leases.map(
+          lease =>
+            `  held for ${roughly(now - lease.acquiredAt)} by ${lease.session}${noteOf(lease)}  since ${clockTime(lease.acquiredAt)}, lease ${lease.id}`,
+        );
+        const queueLines = line.map(
+          (waiter, index) =>
+            `  ${index + 1}. ${waiter.session}  waiting ${roughly(now - waiter.enqueuedAt)}${waiter.keptUntil === null ? '' : `  (place kept ${roughly(waiter.keptUntil - now)} more)`}${waiter.note === null ? '' : `  "${waiter.note}"`}`,
+        );
+        const downLine =
+          state?.lastDownAt == null
+            ? []
+            : [`  last down ${roughly(now - state.lastDownAt)} ago, exit ${state.lastDownExit}`];
+        const owedDownLine =
+          owedDown === undefined
+            ? []
+            : [
+                describeOwedDown(owedDown, {
+                  idleAfterMs: settings.down?.idleAfterMs,
+                  isWatcherRestarted,
+                  now,
+                }),
+              ];
+        return [header, ...leaseLines, ...queueLines, ...owedDownLine, ...downLine].join('\n');
+      },
+    )
     .join('\n\n');
 };

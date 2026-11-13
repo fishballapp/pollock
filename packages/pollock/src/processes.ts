@@ -8,6 +8,7 @@ import * as FileSystem from 'effect/FileSystem';
 import * as Layer from 'effect/Layer';
 import * as Option from 'effect/Option';
 import * as Path from 'effect/Path';
+import * as Predicate from 'effect/Predicate';
 import * as ChildProcess from 'effect/process/ChildProcess';
 import * as ChildProcessSpawner from 'effect/process/ChildProcessSpawner';
 import * as Schedule from 'effect/Schedule';
@@ -41,8 +42,10 @@ export class Processes extends Context.Service<
       readonly heartbeatMs: number;
       readonly onHeartbeat: Effect.Effect<void>;
     }) => Effect.Effect<HookOutcome>;
-    /** Starts `pollock watch <resource>` detached, outliving this command. */
+    /** Starts `pollock watch <resource>` detached and orphaned, outliving this command. */
     readonly startWatcher: (resource: string) => Effect.Effect<void>;
+    /** Whether a process `pid` exists; it may be another one that got the pid since. */
+    readonly isRunning: (pid: number) => Effect.Effect<boolean>;
   }
 >()('pollock/Processes') {
   static readonly layer = Layer.effect(
@@ -124,10 +127,22 @@ export class Processes extends Context.Service<
           }
           yield* Effect.scoped(
             Effect.gen(function* () {
+              // Through a shell that backgrounds the watcher and exits, so it is nobody's child
+              // from the start. As a child of this command it is in the process tree of whatever
+              // runs the command, and a harness stopping its agent kills that whole tree.
               const handle = yield* spawner.spawn(
                 ChildProcess.make(
-                  process.execPath,
-                  [...process.execArgv, script, 'watch', resource],
+                  '/bin/sh',
+                  [
+                    '-c',
+                    '"$@" &',
+                    'sh',
+                    process.execPath,
+                    ...process.execArgv,
+                    script,
+                    'watch',
+                    resource,
+                  ],
                   {
                     detached: true,
                     stdin: 'ignore',
@@ -138,8 +153,20 @@ export class Processes extends Context.Service<
               );
               yield* Effect.asVoid(handle.unref);
             }),
-          ).pipe(Effect.orDie);
+            // Uninterruptible: a scope closed before the unref would kill the watcher with it.
+          ).pipe(Effect.orDie, Effect.uninterruptible);
         }),
+
+        isRunning: pid =>
+          Effect.sync(() => {
+            try {
+              process.kill(pid, 0);
+              return true;
+            } catch (error) {
+              // EPERM: it exists and is another user's. Anything else: no such process.
+              return Predicate.hasProperty(error, 'code') && error.code === 'EPERM';
+            }
+          }),
       });
     }),
   );

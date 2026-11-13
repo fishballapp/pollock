@@ -10,8 +10,10 @@ import {
   keepPlace,
   type Lease,
   leaseToRelease,
+  leaveWatch,
   markInUse,
   markReported,
+  owedDown,
   release,
   type Step,
   snapshot,
@@ -70,7 +72,6 @@ const world = (resource: ResourceSettings = exclusive, timings: Timings = TIMING
     enqueueAt,
     queue,
     step: lookAt,
-    /** `session` gets in line and is granted at once; its lease. */
     /** `session` gets in line and is granted at once, its resource marked in use; its lease. */
     hold: (session: string, now: number) => {
       const stepped = lookAt(queue(session, now), now);
@@ -332,7 +333,62 @@ describe('hooks and the idle watcher', () => {
     const look = (now: number, pid: number) =>
       tx(now, db => watchStep(db, { resource: withDown, pid, token: `t${now}`, now, timings }));
     expect(look(1, 1)).toBe('wait');
-    expect(look(2, 2)).toBe('exit');
-    expect(look(200, 2)).toBe('wait');
+    expect(look(2, 2)).toBe('taken');
+    // The first stopped refreshing: once its last look is stale, the second takes over.
+    expect(look(100, 2)).toBe('taken');
+    expect(look(101, 2)).toBe('wait');
+    expect(look(102, 1)).toBe('taken');
+  });
+
+  it('owes the down from the release on, and says whether a watcher is alive to run it', () => {
+    const { tx, hold, release, timings } = world(withDown);
+    const owed = (now: number) => tx(now, db => owedDown(db, { resource: withDown, now, timings }));
+    expect(owed(0)).toBeUndefined();
+    const a = hold('a', 0);
+    tx(1, db => watchStep(db, { resource: withDown, pid: 1, token: 't', now: 1, timings }));
+    expect(owed(2)).toEqual({ dueAt: null, isWatched: true, watcherPid: 1 });
+    release(a, 10);
+    // The watcher was killed after its look at 1: it looks alive until that look is stale.
+    expect(owed(20)).toEqual({ dueAt: 70, isWatched: true, watcherPid: 1 });
+    expect(owed(101)).toEqual({ dueAt: 70, isWatched: false, watcherPid: 1 });
+    // A watcher is being started for it now: a command arriving before it registers starts none.
+    expect(owed(102)).toEqual({ dueAt: 70, isWatched: true, watcherPid: null });
+    // It finds the down due since the release, not since its own first look.
+    expect(
+      tx(103, db => watchStep(db, { resource: withDown, pid: 2, token: 't', now: 103, timings })),
+    ).toBe('down');
+    expect(owed(104)).toBeUndefined();
+  });
+
+  it('hands back what a stopped watcher holds: its registration, and the down it was running', () => {
+    const { db, tx, hold, release, timings } = world(withDown);
+    const look = (now: number, pid: number, token: string) =>
+      tx(now, db => watchStep(db, { resource: withDown, pid, token, now, timings }));
+    release(hold('a', 0), 1);
+    expect(look(2, 1, 'idle')).toBe('wait');
+    expect(look(52, 1, 'down')).toBe('down');
+    tx(53, db => leaveWatch(db, { resource: 'vm', pid: 1, downToken: 'down' }));
+    expect(snapshot(db, { only: 'vm', alsoInclude: [], now: 53, timings })[0]?.state).toMatchObject(
+      { hook: null, needsDown: 1, watcherPid: null },
+    );
+    // Well inside the stale window, another watcher runs the down.
+    expect(look(54, 2, 'again')).toBe('down');
+  });
+
+  it('owes the down again when the watcher running it was killed', () => {
+    const { tx, hold, release, timings } = world(withDown);
+    const look = (now: number, pid: number) =>
+      tx(now, db => watchStep(db, { resource: withDown, pid, token: `t${now}`, now, timings }));
+    release(hold('a', 0), 1);
+    expect(look(2, 1)).toBe('wait');
+    expect(look(52, 1)).toBe('down');
+    // While its claim is fresh the down is running, not owed.
+    expect(tx(60, db => owedDown(db, { resource: withDown, now: 60, timings }))).toBeUndefined();
+    expect(tx(152, db => owedDown(db, { resource: withDown, now: 152, timings }))).toEqual({
+      dueAt: 52,
+      isWatched: false,
+      watcherPid: 1,
+    });
+    expect(look(153, 2)).toBe('down');
   });
 });

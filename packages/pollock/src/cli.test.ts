@@ -5,12 +5,13 @@
 // after 10s, a kept place lasts a minute); a test that is about a bound sets a short one for its own
 // processes and waits on the state it changes. A hook that must still be running when something
 // arrives waits for a gate file the test creates, rather than for a time.
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { promisify } from 'node:util';
 import * as Option from 'effect/Option';
 import { build } from 'tsdown';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -44,16 +45,22 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'pollock-test-'));
 });
 
+/** The pids of every process running this run's bin: commands still going, and watchers. */
+const binProcesses = async () => {
+  // pgrep exits 1 when nothing matches.
+  const { stdout } = await promisify(execFile)('pgrep', ['-f', bin]).catch(() => ({ stdout: '' }));
+  return stdout.split('\n').filter(Boolean).map(Number);
+};
+
 afterEach(async () => {
-  // A test that ends with a lease held leaves its resource's watcher waiting for ever.
-  if (existsSync(join(dir, 'state', 'pollock.db'))) {
-    for (const { pid } of readDatabase('SELECT watcher_pid AS pid FROM resource_state')) {
-      if (typeof pid !== 'number') continue;
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        // Already gone.
-      }
+  // Watchers are detached and outlive the test: one waits for ever when a lease is left held, and
+  // one started by a release stands by for a while. A hook such a process was running is in its
+  // own process group and survives it; `waitFor` ends those once the directory is gone.
+  for (const pid of await binProcesses()) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
     }
   }
   await rm(dir, { recursive: true, force: true });
@@ -101,9 +108,13 @@ const start = (args: readonly string[], env: Record<string, string> = {}) => {
 /** Runs `pollock <args>` to the end. */
 const pollock = (...args: string[]) => start(args).done;
 
-/** A file a hook waits for (`waitFor(gate)`) until the test creates it (`open(gate)`). */
+/**
+ * A file a hook waits for (`waitFor(gate)`) until the test creates it (`open(gate)`). The wait also
+ * ends when the test's directory is removed, so no hook outlives its test.
+ */
 const gate = (name: string) => join(dir, name);
-const waitFor = (path: string) => `while [ ! -e ${path} ]; do sleep 0.05; done`;
+const waitFor = (path: string) =>
+  `while [ ! -e ${path} ] && [ -d ${dir} ]; do sleep 0.05; done; [ -d ${dir} ] || exit 1`;
 const open = (path: string) => writeFile(path, '');
 
 const json = (outcome: Outcome) => JSON.parse(outcome.stdout);
@@ -445,30 +456,85 @@ describe('hooks', () => {
     expect(errorOf(outcome).message).toContain('was force-released');
   });
 
-  it('hands back a stopped watcher’s claims, so the next grant’s watcher runs the down', async () => {
+  it('hands back a stopped watcher’s claims, so the next watcher runs the down', async () => {
     const log = join(dir, 'down.log');
     await configure({
       vm: { down: `echo down >> ${log}; ${waitFor(gate('never'))}`, idleAfter: '50ms' },
     });
     const downs = async () =>
       (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
-    const state = (column: string) =>
-      count(`SELECT ${column} AS count FROM resource_state WHERE resource = ?`, 'vm');
+    const watcherPid = () =>
+      count('SELECT watcher_pid AS count FROM resource_state WHERE resource = ?', 'vm');
     await pollock('vm', 'acquire', '--session', 'a');
     await pollock('vm', 'release', '--session', 'a');
     await until(async () => (await downs()) === 1);
 
-    process.kill(state('watcher_pid'), 'SIGTERM');
-    await until(async () => state('watcher_pid') === 0);
-    expect({ hook: state('hook IS NOT NULL'), needsDown: state('needs_down') }).toEqual({
-      hook: 0,
-      needsDown: 1,
-    });
+    // The release started a second watcher. It takes over: at once if it had not looked yet,
+    // else when it looks again after standing by for the stale window (10s).
+    const stopped = watcherPid();
+    process.kill(stopped, 'SIGTERM');
+    await until(async () => (await downs()) === 2, 40_000);
+    expect(watcherPid()).not.toBe(stopped);
+  });
 
-    // Within what would have been the stale window (10s), a grant and release start a watcher.
-    await pollock('vm', 'acquire', '--session', 'b');
-    await pollock('vm', 'release', '--session', 'b');
-    await until(async () => (await downs()) === 2);
+  it('runs down after a force-release though the holder’s processes and the watcher were killed', async () => {
+    // Staleness is under test: the killed watcher looks alive for this long.
+    const staleSoon = { POLLOCK_STALE_AFTER: '2s' };
+    const log = join(dir, 'down.log');
+    const upDone = gate('up-done');
+    await configure({
+      vm: { up: waitFor(upDone), down: `echo down >> ${log}`, idleAfter: '50ms' },
+    });
+    const downs = async () =>
+      (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
+
+    // A harness kills everything its agent started: the acquire (still in up) and the watcher.
+    const holder = start(['vm', 'acquire', '--session', 'holder'], staleSoon);
+    await until(async () => holder.output.stderr.includes('running up'));
+    const watcherPid = () =>
+      count('SELECT watcher_pid AS count FROM resource_state WHERE resource = ?', 'vm');
+    await until(async () => watcherPid() > 0);
+    process.kill(watcherPid(), 'SIGKILL');
+    holder.child.kill('SIGKILL');
+    await holder.done;
+    await open(upDone);
+    expect(await binProcesses()).toEqual([]);
+    expect(holderCount('vm')).toBe(1);
+
+    // Another session frees the lease at once, while the dead watcher still looks alive.
+    const forced = await start(['vm', 'release', '--force', '--session', 'other'], staleSoon).done;
+    expect(json(forced)).toMatchObject({ released: true, forced: true, session: 'holder' });
+    await until(async () => (await downs()) === 1);
+  });
+
+  it('starts a watcher from status when the one that owed a down was killed', async () => {
+    const staleSoon = { POLLOCK_STALE_AFTER: '1s' };
+    const log = join(dir, 'down.log');
+    await configure({ vm: { down: `echo down >> ${log}`, idleAfter: '4s' } });
+    const watcherPid = () =>
+      count('SELECT watcher_pid AS count FROM resource_state WHERE resource = ?', 'vm');
+    const status = async () =>
+      json(await start(['vm', 'status', '--json'], staleSoon).done).resources[0].pendingDown;
+
+    expect(await status()).toBeNull();
+    expect((await start(['vm', 'acquire', '--session', 'a'], staleSoon).done).code).toBe(0);
+    await until(async () => watcherPid() > 0);
+    expect(await status()).toEqual({ at: null, watcherRestarted: false });
+    // Released, with a watcher standing by beside the first: both are killed.
+    expect((await start(['vm', 'release', '--session', 'a'], staleSoon).done).code).toBe(0);
+    for (const pid of await binProcesses()) process.kill(pid, 'SIGKILL');
+
+    // The resource is idle and up, with nothing left to shut it down, until a command looks. The
+    // dead watcher's heartbeat is still fresh; its pid gives it away.
+    expect(await status()).toEqual({ at: expect.any(String), watcherRestarted: true });
+    const table = await start(['vm', 'status'], staleSoon).done;
+    expect(table.stdout).toMatch(/\n {2}down (in \S+|was due \S+ ago)/u);
+
+    // Killed again: a release with nothing to release is a command that looks, too.
+    for (const pid of await binProcesses()) process.kill(pid, 'SIGKILL');
+    expect((await start(['vm', 'release', '--session', 'a'], staleSoon).done).code).toBe(4);
+    await until(async () => existsSync(log));
+    expect(await status()).toBeNull();
   });
 
   it('undoes the grant when up fails, and says why', async () => {
@@ -603,6 +669,7 @@ describe('the command line', () => {
           },
         ],
         hookRunning: null,
+        pendingDown: null,
         lastDown: null,
       },
     ]);
